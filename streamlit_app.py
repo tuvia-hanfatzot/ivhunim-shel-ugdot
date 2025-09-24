@@ -192,6 +192,22 @@ def harvest_ids_from_zip(zf: zipfile.ZipFile) -> Tuple[pd.DataFrame, List[str]]:
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill, Font, Alignment
+
+# Style constants
+HEADER_ORANGE = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")  # Excel orange
+BLACK_FILL    = PatternFill(start_color="000000", end_color="000000", fill_type="solid")
+CENTER_ALIGN  = Alignment(horizontal="center", vertical="center", wrap_text=False)
+
+# Column layout (RTL): A..F
+COL_MSD          = "A"  # מס"ד (numeric/string, replaces Folder)
+COL_SHEM_TIAUM   = "B"  # שם תיאום (left empty per request)
+COL_TZ_MISHTATF  = "C"  # ת"ז משתתפים (replaces ID)
+COL_PNIYA        = "D"  # פנייה (empty)
+COL_TAFKID       = "E"  # תפקיד (רק למי שמסורב) (empty)
+COL_MODIIN       = "F"  # תגובת מודיעין (empty)
+
+HEADERS_RTL = ["מס\"ד", "שם תיאום", "ת\"ז משתתפים", "פנייה", "תפקיד (רק למי שמסורב)", "תגובת מודיעין"]
 
 YELLOW_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 BLACK_FILL  = PatternFill(start_color="000000", end_color="000000", fill_type="solid")
@@ -204,40 +220,44 @@ def _sanitize_sheet_title(name: str) -> str:
 
 def _is_solid_fill(cell) -> bool:
     try:
-        return cell.fill is not None and cell.fill.fill_type == "solid"
+        return cell.fill is not None and cell.fill.fill_type == "solid" and (
+            (cell.fill.start_color.rgb or "").upper().endswith("000000")  # black
+        )
     except Exception:
         return False
 
 def _is_separator_row(ws, row_idx: int) -> bool:
-    # A separator row is the full black row we created across A:B
-    a = ws[f"A{row_idx}"]; b = ws[f"B{row_idx}"]
-    return _is_solid_fill(a) and _is_solid_fill(b)
+    # a separator = full black row across A:F
+    cols = ["A", "B", "C", "D", "E", "F"]
+    return all(_is_solid_fill(ws[f"{c}{row_idx}"]) for c in cols)
 
 def _parse_summary(ws_summary):
     """
-    Parse the existing Summary sheet into ordered blocks:
-    returns: blocks = [
-      {"folder": str, "start": int, "end": int, "sep": int, "ids": [str, ...]}
-    ]
-    where rows [start..end] are ID rows (header is row 1), and 'sep' is the separator row index.
+    Parse the 'Summary' sheet in RTL 6-col layout:
+    A: מס"ד      (folder)
+    B: שם תיאום  (blank)
+    C: ת"ז משתתפים (ID)
+    D: פנייה      (blank)
+    E: תפקיד...   (blank)
+    F: תגובת מודיעין (blank)
+
+    Returns blocks: [{"folder": str, "start": int, "end": int, "sep": int|None, "ids": [str, ...]}]
     """
     blocks = []
     max_row = ws_summary.max_row
     r = 2  # skip header
     while r <= max_row:
-        # skip any empty/separator padding before a block
+        # skip any leading separators/empty
         while r <= max_row and _is_separator_row(ws_summary, r):
             r += 1
-        while r <= max_row and (ws_summary[f"A{r}"].value in (None, "") and ws_summary[f"B{r}"].value in (None, "")):
+        while r <= max_row and all(ws_summary[f"{c}{r}"].value in (None, "") for c in ["A","B","C","D","E","F"]):
             r += 1
         if r > max_row:
             break
 
-        # start of a block
+        # start of block
         folder = ws_summary[f"A{r}"].value
-        # if the first ID row has blank folder (e.g., malformed), forward-fill from above
         if not folder and r > 2:
-            # find last seen folder upwards
             rr = r - 1
             while rr >= 2 and ws_summary[f"A{rr}"].value in (None, ""):
                 rr -= 1
@@ -245,16 +265,15 @@ def _parse_summary(ws_summary):
 
         start = r
         ids = []
-        # collect until separator or end
         while r <= max_row and not _is_separator_row(ws_summary, r):
-            id_val = ws_summary[f"B{r}"].value
+            id_val = ws_summary[f"C{r}"].value  # IDs live in col C
             if id_val not in (None, ""):
                 ids.append(str(id_val))
             r += 1
         end = r - 1
         sep = r if (r <= max_row and _is_separator_row(ws_summary, r)) else None
         if sep:
-            r += 1  # move past separator
+            r += 1
         blocks.append({"folder": str(folder) if folder is not None else "", "start": start, "end": end, "sep": sep, "ids": ids})
     return blocks
 
@@ -279,63 +298,64 @@ def _append_ids_to_folder_sheet(wb, folder: str, new_ids: list[str]):
 
 def update_existing_workbook(existing_xlsx: bytes, update_df: pd.DataFrame) -> bytes:
     """
-    existing_xlsx: the original Excel you previously generated.
-    update_df: DataFrame with columns [Folder, ID, file_order, row_order] (from harvest_ids_from_zip on the update ZIP).
-
-    Behaviour:
-      • Only adds IDs that are not already present under the same Folder.
-      • For existing Folders: insert new ID rows just before that folder's separator row.
-      • For new Folders: append a new block at the bottom (Folder shown once, then IDs, then a black separator).
-      • Newly added rows in Summary are highlighted in yellow.
-      • Per-folder sheets are created/updated accordingly.
+    Update the RTL Summary sheet (A..F) where only A=מס\"ד and C=ת\"ז משתתפים are editable.
+    New IDs for an existing מס\"ד are inserted just before its separator row.
+    New מס\"ד blocks are appended at the bottom.
+    Newly added rows are highlighted in yellow (A..F for those rows).
     """
     wb = load_workbook(io.BytesIO(existing_xlsx))
     if "Summary" not in wb.sheetnames:
         raise RuntimeError("The uploaded Excel has no 'Summary' sheet.")
 
     ws = wb["Summary"]
+    ws.sheet_view.rightToLeft = True  # keep RTL if missing
     blocks = _parse_summary(ws)
 
-    # Build current index: folder -> set of IDs, plus quick locators
     folder_to_ids = {b["folder"]: set(b["ids"]) for b in blocks}
-    folder_order   = [b["folder"] for b in blocks]  # preserve display order
+    folder_order  = [b["folder"] for b in blocks]
 
-    # Prepare additions: folder -> [new_ids in desired order]
-    # Keep update_df order (file_order then row_order)
+    # Prepare additions from update_df
     upd_sorted = update_df.sort_values(["Folder", "file_order", "row_order"])
     additions: dict[str, list[str]] = {}
     for folder, sub in upd_sorted.groupby("Folder", sort=False):
         have = folder_to_ids.get(folder, set())
-        to_add = [pid for pid in sub["ID"].astype(str).tolist() if pid not in have]
+        to_add = [str(pid) for pid in sub["ID"].astype(str).tolist() if pid not in have]
         if to_add:
             additions[folder] = to_add
 
-    # Fast exit if nothing to add
     if not additions:
         out = io.BytesIO()
         wb.save(out)
         return out.getvalue()
 
-    # 1) Update existing folders: insert new rows before their separator
-    # We must adjust row indexes as we insert; so we process blocks bottom-up
+    # Bottom-up insert for existing folders
     blocks_by_folder = {b["folder"]: b for b in blocks}
     for folder in reversed(folder_order):
         if folder not in additions:
             continue
         new_ids = additions[folder]
         b = blocks_by_folder[folder]
-        insert_at = (b["sep"] if b["sep"] else b["end"] + 1)  # insert before separator, or at end if no sep
-        # Insert N rows
+        insert_at = (b["sep"] if b["sep"] else b["end"] + 1)
+
         ws.insert_rows(insert_at, amount=len(new_ids))
-        # Write the new ID rows (folder col blank except optionally the first line—keep consistent with your format)
         r = insert_at
-        for i, pid in enumerate(new_ids, start=0):
-            ws[f"A{r}"].value = ""  # keep folder label only on the first original row
-            ws[f"B{r}"].value = pid
-            ws[f"A{r}"].fill = YELLOW_FILL
-            ws[f"B{r}"].fill = YELLOW_FILL
+        for idx, pid in enumerate(new_ids):
+            # Populate only A (מס"ד) for the first row (to keep compact display),
+            # and C (ת"ז משתתפים) for each row. Other columns remain blank.
+            ws[f"{COL_MSD}{r}"].value = folder if idx == 0 else ""
+            ws[f"{COL_SHEM_TIAUM}{r}"].value = ""
+            ws[f"{COL_TZ_MISHTATF}{r}"].value = pid
+            ws[f"{COL_PNIYA}{r}"].value = ""
+            ws[f"{COL_TAFKID}{r}"].value = ""
+            ws[f"{COL_MODIIN}{r}"].value = ""
+            # Yellow highlight & center alignment across A:F
+            for col in ["A","B","C","D","E","F"]:
+                cell = ws[f"{col}{r}"]
+                cell.fill = YELLOW_FILL
+                cell.alignment = CENTER_ALIGN
             r += 1
-        # Shift recorded indices for all following blocks
+
+        # shift indices for blocks following
         shift = len(new_ids)
         for bb in blocks:
             if bb["start"] >= insert_at:
@@ -344,114 +364,127 @@ def update_existing_workbook(existing_xlsx: bytes, update_df: pd.DataFrame) -> b
                 bb["end"] += shift
             if bb["sep"] and bb["sep"] >= insert_at:
                 bb["sep"] += shift
-        # Update this folder's block ids set
-        folder_to_ids[folder].update(new_ids)
-        # Update folder sheet
-        _append_ids_to_folder_sheet(wb, folder, new_ids)
 
-    # 2) New folders: append at bottom (after the final content)
-    new_folders = [f for f in additions.keys() if f not in folder_to_ids]
+        folder_to_ids[folder].update(new_ids)
+
+    # New folders: append at bottom
+    new_folders = [f for f in additions.keys() if f not in blocks_by_folder]
     if new_folders:
-        # Find bottom index (after removing trailing empty area)
         last_row = ws.max_row
-        # Ensure there is at least a blank line before adding (optional)
-        # Append each new folder block
         for folder in new_folders:
             new_ids = additions[folder]
-            # Write block: first row shows folder name, first ID; subsequent rows blank in col A
-            # Row 1: header exists already
-            # Start writing at last_row + 1
-            row = last_row + 1
             if not new_ids:
                 continue
-            ws.cell(row=row, column=1, value=folder)
-            ws.cell(row=row, column=2, value=new_ids[0])
-            ws[f"A{row}"].fill = YELLOW_FILL
-            ws[f"B{row}"].fill = YELLOW_FILL
+            row = last_row + 1
+            # first row with מס"ד + first ID
+            ws[f"{COL_MSD}{row}"].value = folder
+            ws[f"{COL_SHEM_TIAUM}{row}"].value = ""
+            ws[f"{COL_TZ_MISHTATF}{row}"].value = new_ids[0]
+            ws[f"{COL_PNIYA}{row}"].value = ""
+            ws[f"{COL_TAFKID}{row}"].value = ""
+            ws[f"{COL_MODIIN}{row}"].value = ""
+            for col in ["A","B","C","D","E","F"]:
+                cell = ws[f"{col}{row}"]
+                cell.fill = YELLOW_FILL
+                cell.alignment = CENTER_ALIGN
             row += 1
+            # remaining IDs
             for pid in new_ids[1:]:
-                ws.cell(row=row, column=1, value="")
-                ws.cell(row=row, column=2, value=pid)
-                ws[f"A{row}"].fill = YELLOW_FILL
-                ws[f"B{row}"].fill = YELLOW_FILL
+                for col in ["A","B","C","D","E","F"]:
+                    ws[f"{col}{row}"].value = ""
+                ws[f"{COL_TZ_MISHTATF}{row}"].value = pid
+                for col in ["A","B","C","D","E","F"]:
+                    cell = ws[f"{col}{row}"]
+                    cell.fill = YELLOW_FILL
+                    cell.alignment = CENTER_ALIGN
                 row += 1
-            # Separator row
-            ws.cell(row=row, column=1, value="")
-            ws.cell(row=row, column=2, value="")
-            ws[f"A{row}"].fill = BLACK_FILL
-            ws[f"B{row}"].fill = BLACK_FILL
+            # separator row
+            for col in ["A","B","C","D","E","F"]:
+                ws[f"{col}{row}"].value = ""
+                ws[f"{col}{row}"].fill = BLACK_FILL
+                ws[f"{col}{row}"].alignment = CENTER_ALIGN
             last_row = row
-            # Create per-folder sheet
-            _append_ids_to_folder_sheet(wb, folder, new_ids)
 
-    # Keep basic cosmetics (header freeze remains)
+    # Keep header orange + centered (in case the source wasn't)
+    for i in range(1, 7):
+        h = ws.cell(row=1, column=i)
+        h.fill = HEADER_ORANGE
+        h.font = Font(bold=True)
+        h.alignment = CENTER_ALIGN
+
+    # Ensure RTL and centre alignment across body
+    ws.sheet_view.rightToLeft = True
+    for r in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=6):
+        for c in r:
+            if c.fill is None or c.row == 1:
+                c.alignment = CENTER_ALIGN
+
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     """
-    Build an Excel workbook:
-      - Summary sheet: two columns [Folder, ID].
-        * For each folder, write the folder number only once next to the first ID.
-        * Insert a full black separator row after each folder block.
-      - One sheet per folder: single column [ID].
-      - IDs are ordered by file traversal order, then by appearance within the file.
+    Create Excel with RTL 'Summary' sheet and columns:
+    A מס"ד | B שם תיאום | C ת"ז משתתפים | D פנייה | E תפקיד (רק למי שמסורב) | F תגובת מודיעין
+    Only A (מס"ד) and C (ת"ז משתתפים) are filled. Others remain empty.
+    All cells centered; header row orange.
+    A black full-width separator row after each מס"ד block.
     """
     from openpyxl import Workbook
-    from openpyxl.styles import PatternFill
 
-    # Ensure ordering by (Folder -> file_order -> row_order)
     df_sorted = df.sort_values(["Folder", "file_order", "row_order"]).reset_index(drop=True)
 
     wb = Workbook()
-    ws_summary = wb.active
-    ws_summary.title = "Summary"
+    ws = wb.active
+    ws.title = "Summary"
+    ws.sheet_view.rightToLeft = True  # RTL sheet
 
-    # Headers
-    ws_summary.append(["Folder", "ID"])
+    # Header
+    ws.append(HEADERS_RTL)
+    for i, _ in enumerate(HEADERS_RTL, start=1):
+        cell = ws.cell(row=1, column=i)
+        cell.fill = HEADER_ORANGE
+        cell.font = Font(bold=True)
+        cell.alignment = CENTER_ALIGN
 
-    # Write grouped blocks
-    black_fill = PatternFill(start_color="000000", end_color="000000", fill_type="solid")
-
+    # Body
     for folder, sub in df_sorted.groupby("Folder", sort=True):
         sub = sub.sort_values(["file_order", "row_order"])
         first = True
         for _, row in sub.iterrows():
-            ws_summary.append([folder if first else "", row["ID"]])
+            values = ["", "", "", "", "", ""]
+            # Only A (מס"ד) and C (ת"ז משתתפים) are populated
+            values[0] = folder if first else ""         # A
+            values[2] = str(row["ID"])                  # C
+            ws.append(values)
+            # center alignment for the whole new row
+            r = ws.max_row
+            for col_idx in range(1, 7):
+                ws.cell(row=r, column=col_idx).alignment = CENTER_ALIGN
             first = False
-        # Separator row (full black across used columns A:B)
-        sep_row_idx = ws_summary.max_row + 1
-        ws_summary.append(["", ""])
-        for col in ("A", "B"):
-            ws_summary[f"{col}{sep_row_idx}"].fill = black_fill
 
-    # Auto-width (simple)
-    for ws in [ws_summary]:
-        for col_cells in ws.columns:
-            length = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
-            ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 10), 40)
+        # separator row across A:F in black
+        sep_row_idx = ws.max_row + 1
+        ws.append(["", "", "", "", "", ""])
+        for col in range(1, 7):
+            ws.cell(row=sep_row_idx, column=col).fill = BLACK_FILL
 
-    # Per-folder sheets: only IDs, ordered by file then within-file order
-    for folder, sub in df_sorted.groupby("Folder", sort=True):
-        ws = wb.create_sheet(title=_sanitize_sheet_title(folder))
-        ws.append(["ID"])
-        for _, row in sub.iterrows():
-            ws.append([row["ID"]])
-        # Basic width
-        ws.column_dimensions["A"].width = 20
+    # Column widths (simple auto)
+    for col_cells in ws.columns:
+        length = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
+        ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 12), 40)
 
-    # Remove the trailing all-black separator at end if you prefer not to have a final one:
-    # (Uncomment to drop if desired)
-    # last = ws_summary.max_row
-    # if last >= 2 and all((ws_summary[f"A{last}"].fill == black_fill,
-    #                       ws_summary[f"B{last}"].fill == black_fill)):
-    #     ws_summary.delete_rows(last, 1)
+    ws.freeze_panes = "A2"
 
-    # Save to bytes
-    output = io.BytesIO()
-    wb.save(output)
-    return output.getvalue()
+    # Ensure all body cells are centered (in case)
+    for r in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=6):
+        for c in r:
+            c.alignment = CENTER_ALIGN
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="ID Harvester to Excel", page_icon="📄", layout="wide")
